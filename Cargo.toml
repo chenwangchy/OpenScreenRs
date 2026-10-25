@@ -1,0 +1,23 @@
+[package]
+name = "openscreen-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Screen sharing over the network: DXGI desktop duplication + libjpeg-turbo, MJPEG to a browser"
+
+# No dependencies on purpose: the COM interfaces and the JPEG library are called directly.
+# That keeps `cargo build` working with nothing but rustup installed (no C compiler, no
+# Visual Studio, no build-time tools), and the release binary stays around 300 KB.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+# WebRTC needs an async runtime and its own transport stack. This is the price of the UDP path:
+# the project is no longer dependency free.
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+webrtc = "0.20"
+# the types live in rtc; webrtc is a facade over it
+rtc = "0.20"

@@ -1,0 +1,5 @@
+﻿# Pinned to MSVC so proc-macro and native dependencies can build: the GNU toolchain on this
+# machine has no dlltool, which rules out anything that needs a proc-macro. MSVC also links
+# three times faster and produces a smaller binary.
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
