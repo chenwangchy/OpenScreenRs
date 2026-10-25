@@ -37,6 +37,7 @@ pub const PAGE: &str = r##"<!doctype html>
   select, input { background: #23262e; color: #e6e6e6; border: 1px solid #333844;
                   border-radius: 7px; padding: 7px 9px; font: inherit; min-width: 150px; }
   select:disabled, input:disabled { opacity: .45; }
+  .hint { font-size: 12px; color: #8b93a1; margin: -6px 0 10px; }
   .actions { display: flex; gap: 10px; align-items: center; }
   button.primary { flex: 1; padding: 12px; border-radius: 9px; border: 0; cursor: pointer;
                    background: #2f6fd0; color: #fff; font: inherit; font-weight: 600; }
@@ -65,6 +66,7 @@ pub const PAGE: &str = r##"<!doctype html>
     <label class="row"><span>共享哪块屏幕</span>
       <select id="screen"></select>
     </label>
+    <div id="capturing" class="hint"></div>
     <label class="row"><span>分辨率</span>
       <select id="height">
         <option value="0">原生（最清晰）</option>
@@ -209,6 +211,19 @@ pub const PAGE: &str = r##"<!doctype html>
       option.textContent = item;
       address.appendChild(option);
     });
+
+    // Which monitor is really being captured: the GPU refuses to duplicate some of them, and the
+    // viewer would otherwise be looking at a screen nobody asked for.
+    const label = (index) => {
+      const item = (settings.screens || []).find((candidate) => candidate.index === index);
+      return item ? describe(item) : '#' + index;
+    };
+
+    const capturing = document.getElementById('capturing');
+    capturing.textContent = settings.capturing === null || settings.capturing === undefined
+      ? '当前没有在抓屏（等观看端连接）'
+      : '实际抓取：' + label(settings.capturing) +
+        (settings.viewers ? '　观看中：' + settings.viewers : '');
 
     paint();
     showAddress();

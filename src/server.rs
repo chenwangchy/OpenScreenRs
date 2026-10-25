@@ -102,14 +102,6 @@ fn default_ffmpeg_path() -> PathBuf {
 }
 
 impl Mode {
-    fn ffmpeg_path(&self) -> Option<PathBuf> {
-        match self {
-            Mode::Mjpeg { .. } => None,
-            Mode::H264 { ffmpeg, .. } | Mode::Mse { ffmpeg, .. } | Mode::WebRtc { ffmpeg, .. } => {
-                Some(ffmpeg.clone())
-            }
-        }
-    }
 
     fn profile(&self) -> ffmpeg::Profile {
         match self {
@@ -186,6 +178,8 @@ struct Shared {
     /// Size of the frames being produced, which is how cursor positions are scaled.
     frame_size: (usize, usize),
     cursor: (i32, i32),
+    /// True while the pointer is off the shared monitor, so nothing should be drawn.
+    cursor_hidden: bool,
     cursor_clients: Vec<CursorClient>,
     next_cursor_client: u64,
     /// Description of the pointer shape and its pixels, kept so a late viewer still gets it.
@@ -227,6 +221,8 @@ struct State {
     settings: Mutex<Settings>,
     /// Bumped on every change, so a running encoder knows it has been superseded.
     generation: AtomicU64,
+    /// Which monitor is actually being captured, which is not always the requested one.
+    capturing: Mutex<Option<u32>>,
 }
 
 impl State {
@@ -234,6 +230,7 @@ impl State {
         Self {
             settings: Mutex::new(settings),
             generation: AtomicU64::new(1),
+            capturing: Mutex::new(None),
             shared: Mutex::new(Shared {
                 frame: None,
                 version: 0,
@@ -242,6 +239,7 @@ impl State {
                 closed: false,
                 frame_size: (0, 0),
                 cursor: (-1, -1),
+                cursor_hidden: false,
                 cursor_clients: Vec::new(),
                 next_cursor_client: 1,
                 cursor_meta: None,
@@ -261,6 +259,14 @@ impl State {
     fn set_settings(&self, settings: Settings) {
         *self.settings.lock().unwrap() = settings;
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn set_capturing(&self, index: Option<u32>) {
+        *self.capturing.lock().unwrap() = index;
+    }
+
+    fn capturing(&self) -> Option<u32> {
+        *self.capturing.lock().unwrap()
     }
 
     fn generation(&self) -> u64 {
@@ -342,8 +348,25 @@ impl State {
     }
 
     /// Stores the pointer position and pushes it to every page.
+    /// Tells the viewers there is no pointer to draw, which is true while the pointer sits on a
+    /// monitor that is not the one being shared.
+    fn hide_cursor(&self) {
+        let mut shared = self.shared.lock().unwrap();
+
+        if shared.cursor_hidden {
+            return;
+        }
+
+        shared.cursor_hidden = true;
+
+        shared
+            .cursor_clients
+            .retain_mut(|client| ws::send_text(&mut client.stream, b"{\"cursor\":null}").is_ok());
+    }
+
     fn set_cursor(&self, x: i32, y: i32) {
         let mut shared = self.shared.lock().unwrap();
+        shared.cursor_hidden = false;
         shared.cursor = (x, y);
 
         if shared.cursor_clients.is_empty() {
@@ -355,8 +378,6 @@ impl State {
             .cursor_clients
             .retain_mut(|client| ws::send_text(&mut client.stream, message.as_bytes()).is_ok());
     }
-
-    /// Stores the pointer shape and sends it to every page. The pixels follow their description.
     fn set_cursor_shape(&self, shape: &cursor::Shape) {
         let meta = format!(
             "{{\"cursorImage\":{{\"width\":{},\"height\":{},\"hotspotX\":{},\"hotspotY\":{}}}}}",
@@ -679,6 +700,24 @@ pub fn run(port: u16, height: usize, fps: u32, quality: i32, ffmpeg: PathBuf, mo
     print_addresses(port);
     println!("open that address in a browser to change the settings");
 
+    // Creating the transport up front closes a race: a page that connects in the first moments
+    // would find no hub, receive no offer, and sit there with a dead panel.
+    let (screen_width, screen_height) = sys::screen_size();
+    let (frame_width, frame_height) = scaler::target_size(
+        screen_width.max(1) as usize,
+        screen_height.max(1) as usize,
+        height,
+    );
+    let (_, level_hex) = ffmpeg::level_for(frame_width, frame_height, fps);
+
+    match webrtc_stream::Hub::new(
+        format!("{}{level_hex}", settings.mode.profile().sdp_prefix()),
+        fps,
+    ) {
+        Some(hub) => state.set_hub(hub),
+        None => eprintln!("webrtc: the runtime did not start; that mode will not work"),
+    }
+
     // One encoder per generation. When the panel changes something the counter moves, the running
     // encoder returns (dropping its ffmpeg child) and the next one starts with the new settings.
     let supervisor = Arc::clone(&state);
@@ -781,14 +820,19 @@ fn serve_settings(state: Arc<State>, mut socket: TcpStream, request: &str) {
             .into_iter()
             .map(|output| {
                 format!(
-                    "{{\"index\":{},\"width\":{},\"height\":{},\"primary\":{}}}",
-                    output.index, output.width, output.height, output.primary
+                    "{{\"index\":{},\"left\":{},\"top\":{},\"width\":{},\"height\":{},\"primary\":{}}}",
+                    output.index,
+                    output.left,
+                    output.top,
+                    output.width,
+                    output.height,
+                    output.primary
                 )
             })
             .collect();
 
         let body = format!(
-            "{{\"mode\":\"{}\",\"height\":{},\"fps\":{},\"bitrate\":{},\"quality\":{},\"profile\":\"{}\",\"screen\":{},\"generation\":{},\"addresses\":[{}],\"screens\":[{}]}}",
+            "{{\"mode\":\"{}\",\"height\":{},\"fps\":{},\"bitrate\":{},\"quality\":{},\"profile\":\"{}\",\"screen\":{},\"capturing\":{},\"viewers\":{},\"generation\":{},\"addresses\":[{}],\"screens\":[{}]}}",
             match settings.mode {
                 Mode::Mjpeg { .. } => "mjpeg",
                 Mode::H264 { .. } => "h264",
@@ -808,6 +852,11 @@ fn serve_settings(state: Arc<State>, mut socket: TcpStream, request: &str) {
                 Some(index) => index.to_string(),
                 None => "null".to_string(),
             },
+            match state.capturing() {
+                Some(index) => index.to_string(),
+                None => "null".to_string(),
+            },
+            state.viewers() + state.h264_clients() + state.mse_clients() + state.hub().map(|hub| hub.viewers()).unwrap_or(0),
             state.generation(),
             addresses.join(","),
             screens.join(",")
@@ -996,13 +1045,7 @@ fn serve_cursor_channel(state: Arc<State>, mut socket: TcpStream, request: &str)
     };
 
     // Nothing is expected from the page; reading only tells us when it goes away.
-    let mut scratch = [0u8; 512];
-
-    while let Ok(read) = std::io::Read::read(&mut socket, &mut scratch) {
-        if read == 0 {
-            break;
-        }
-    }
+    ws::watch(&mut socket, |_| {});
 
     state.unregister_cursor_client(id);
 }
@@ -1025,13 +1068,7 @@ fn serve_h264_channel(state: Arc<State>, mut socket: TcpStream, request: &str) {
         Err(_) => return,
     };
 
-    let mut scratch = [0u8; 512];
-
-    while let Ok(read) = std::io::Read::read(&mut socket, &mut scratch) {
-        if read == 0 {
-            break;
-        }
-    }
+    ws::watch(&mut socket, |_| {});
 
     state.unregister_h264_client(id);
 }
@@ -1054,13 +1091,7 @@ fn serve_mse_channel(state: Arc<State>, mut socket: TcpStream, request: &str) {
         Err(_) => return,
     };
 
-    let mut scratch = [0u8; 512];
-
-    while let Ok(read) = std::io::Read::read(&mut socket, &mut scratch) {
-        if read == 0 {
-            break;
-        }
-    }
+    ws::watch(&mut socket, |_| {});
 
     state.unregister_mse_client(id);
 }
@@ -1085,20 +1116,13 @@ fn serve_webrtc_channel(state: Arc<State>, mut socket: TcpStream, request: &str)
     };
 
     let id = hub.add_viewer(writer);
-    let mut scratch = [0u8; 8 * 1024];
 
-    loop {
-        match std::io::Read::read(&mut socket, &mut scratch) {
-            Ok(0) => break,
-            Ok(read) => {
-                // The answer arrives as one text frame, unmasked here and handed to the session.
-                if let Some(sdp) = ws::text_payload(&scratch[..read]) {
-                    hub.accept_answer(id, sdp);
-                }
-            }
-            Err(_) => break,
+    // The answer arrives as one text frame; after that the connection only has to stay alive.
+    ws::watch(&mut socket, |data| {
+        if let Some(sdp) = ws::text_payload(data) {
+            hub.accept_answer(id, sdp);
         }
-    }
+    });
 }
 
 fn serve_stream(state: Arc<State>, mut socket: TcpStream) {
@@ -1136,10 +1160,47 @@ fn serve_stream(state: Arc<State>, mut socket: TcpStream) {
 }
 
 /// Polls the pointer and pushes its position in frame coordinates when it moves.
+/// Maps a pointer position in virtual desktop pixels onto the frame being sent.
+///
+/// `monitor` is (left, top, width, height) of the captured monitor. Returns None when the pointer
+/// is not on that monitor, which is when nothing should be drawn.
+fn cursor_in_frame(
+    cursor: (i32, i32),
+    monitor: (i32, i32, u32, u32),
+    frame: (usize, usize),
+) -> Option<(i32, i32)> {
+    let (left, top, width, height) = monitor;
+
+    if width == 0 || height == 0 || frame.0 == 0 || frame.1 == 0 {
+        return None;
+    }
+
+    let local_x = cursor.0 as i64 - left as i64;
+    let local_y = cursor.1 as i64 - top as i64;
+
+    if local_x < 0 || local_y < 0 || local_x >= width as i64 || local_y >= height as i64 {
+        return None;
+    }
+
+    Some((
+        (local_x * frame.0 as i64 / width as i64) as i32,
+        (local_y * frame.1 as i64 / height as i64) as i32,
+    ))
+}
+
+/// Publishes the pointer position, mapped into the frame that is actually being sent.
+///
+/// The pointer is in virtual desktop pixels while the frame is one monitor, so the position has to
+/// be made relative to the monitor being captured. Using the primary monitor for this (as this
+/// once did) leaves the pointer stuck whenever another monitor is shared.
 fn track_cursor(state: Arc<State>) {
     let mut last = (-1, -1);
     let mut last_shape = isize::MIN;
     let mut tick = 0u32;
+
+    // Enumerating monitors creates a D3D11 device, so it is cached and refreshed slowly.
+    let mut monitors = Duplicator::outputs();
+    let mut monitors_at = Instant::now();
 
     loop {
         std::thread::sleep(CURSOR_POLL);
@@ -1157,20 +1218,42 @@ fn track_cursor(state: Arc<State>) {
             }
         }
 
-        let (x, y) = match sys::cursor_position() {
-            Some(position) => position,
-            None => continue,
+        if monitors_at.elapsed() > Duration::from_secs(2) {
+            monitors = Duplicator::outputs();
+            monitors_at = Instant::now();
+        }
+
+        let Some((x, y)) = sys::cursor_position() else {
+            continue;
         };
 
-        let (screen_width, screen_height) = sys::screen_size();
         let (frame_width, frame_height) = state.frame_size();
 
-        if screen_width <= 0 || screen_height <= 0 || frame_width == 0 || frame_height == 0 {
+        if frame_width == 0 || frame_height == 0 {
             continue;
         }
 
-        let frame_x = (x as i64 * frame_width as i64 / screen_width as i64) as i32;
-        let frame_y = (y as i64 * frame_height as i64 / screen_height as i64) as i32;
+        // The monitor being shared, or the primary one when the capture has not started yet.
+        let monitor = state
+            .capturing()
+            .and_then(|index| monitors.iter().find(|output| output.index == index))
+            .or_else(|| monitors.iter().find(|output| output.primary));
+
+        let Some(monitor) = monitor else {
+            continue;
+        };
+
+        let mapped = cursor_in_frame(
+            (x, y),
+            (monitor.left, monitor.top, monitor.width, monitor.height),
+            (frame_width, frame_height),
+        );
+
+        // The pointer is on another monitor: there is nothing on this screen to point at.
+        let Some((frame_x, frame_y)) = mapped else {
+            state.hide_cursor();
+            continue;
+        };
 
         if (frame_x, frame_y) != last {
             last = (frame_x, frame_y);
@@ -1178,260 +1261,6 @@ fn track_cursor(state: Arc<State>) {
         }
     }
 }
-
-/// Prints why the encoder stopped. ffmpeg knows; the generic message does not.
-fn explain(encoder: &ffmpeg::Encoder, mode: &str) {
-    let reason = encoder.last_error();
-
-    if reason.is_empty() {
-        eprintln!("{mode}: the encoder stopped without producing anything");
-    } else {
-        eprintln!("{mode}: the encoder stopped: {reason}");
-    }
-}
-
-/// Waits before restarting, longer each time it keeps failing, so a broken start does not
-/// scroll the console away.
-fn pause(failures: &mut u32) {
-    *failures += 1;
-    let seconds = 1u64 << (*failures).min(4); // 2, 4, 8, 16
-    eprintln!("retrying in {seconds}s");
-
-    std::thread::sleep(Duration::from_secs(seconds));
-}
-
-/// Runs ffmpeg, splits its output into access units and publishes them.
-/// Starts the encoder the current settings ask for.
-fn encode_for(state: Arc<State>, settings: Settings, generation: u64) {
-
-    let fps = settings.fps;
-    let quality = settings.quality;
-
-    // The chosen monitor, as a rectangle: its own size (not the primary one) and where it sits,
-    // which is what GDI capture needs when desktop duplication is unavailable.
-    let monitors = Duplicator::outputs();
-    let monitor = settings
-        .screen
-        .and_then(|index| monitors.iter().find(|output| output.index == index));
-
-    let (source_width, source_height) = match monitor {
-        Some(output) => (output.width as usize, output.height as usize),
-        None => {
-            let (width, height) = sys::screen_size();
-            (width.max(1) as usize, height.max(1) as usize)
-        }
-    };
-
-    let offset = monitor
-        .map(|output| (output.left, output.top))
-        .unwrap_or((0, 0));
-
-    let height = if settings.height == 0 {
-        source_height
-    } else {
-        settings.height.min(source_height)
-    };
-
-    // The chosen monitor, or whichever one can be duplicated when the choice is automatic.
-    let output_index = settings
-        .screen
-        .unwrap_or_else(|| crate::capture::working_output_index().unwrap_or(0));
-
-    match &settings.mode {
-        Mode::Mjpeg { subsampling } => produce(
-            state,
-            (source_width, source_height),
-            height,
-            fps,
-            quality,
-            *subsampling,
-            settings.screen,
-            generation,
-        ),
-        Mode::H264 {
-            bitrate_kbps,
-            ffmpeg,
-        } => encode_h264(
-            state,
-            (source_width, source_height),
-            height,
-            fps,
-            *bitrate_kbps,
-            output_index,
-            offset,
-            ffmpeg.clone(),
-            generation,
-        ),
-        Mode::Mse {
-            bitrate_kbps,
-            gop,
-            fragment_ms,
-            ffmpeg,
-        } => encode_mse(
-            state,
-            (source_width, source_height),
-            height,
-            fps,
-            *bitrate_kbps,
-            *gop,
-            *fragment_ms,
-            output_index,
-            offset,
-            ffmpeg.clone(),
-            generation,
-        ),
-        Mode::WebRtc {
-            bitrate_kbps,
-            profile,
-            ffmpeg,
-        } => {
-            // The offer's profile-level-id has to describe the stream we send, and that depends on
-            // the resolution the panel picked.
-            let (screen_width, screen_height) = sys::screen_size();
-            let (frame_width, frame_height) = scaler::target_size(
-                screen_width.max(1) as usize,
-                screen_height.max(1) as usize,
-                height,
-            );
-            let (_, level_hex) = ffmpeg::level_for(frame_width, frame_height, fps);
-            let advertised = format!("{}{level_hex}", profile.sdp_prefix());
-
-            let hub = match state.hub() {
-                Some(hub) => hub,
-                None => {
-                    let Some(hub) = webrtc_stream::Hub::new(advertised.clone(), fps) else {
-                        eprintln!("cannot start the WebRTC runtime");
-                        return;
-                    };
-
-                    state.set_hub(Arc::clone(&hub));
-                    hub
-                }
-            };
-
-            hub.set_profile_level_id(advertised);
-
-            encode_webrtc(
-                state,
-                (source_width, source_height),
-                height,
-                fps,
-                *bitrate_kbps,
-                *profile,
-                output_index,
-                offset,
-                ffmpeg.clone(),
-                generation,
-            )
-        }
-    }
-}
-fn encode_h264(state: Arc<State>, source: (usize, usize), height: usize, fps: u32, bitrate_kbps: u32, output_index: u32, offset: (i32, i32), ffmpeg_path: PathBuf, generation: u64) {
-    let (screen_width, screen_height) = source;
-    let (frame_width, frame_height) = scaler::target_size(
-        screen_width.max(1) as usize,
-        screen_height.max(1) as usize,
-        height,
-    );
-
-    state.set_frame_size(frame_width, frame_height);
-    state.set_h264_config(format!(
-        "{{\"config\":{{\"codec\":\"{}\",\"width\":{frame_width},\"height\":{frame_height},\"fps\":{fps}}}}}",
-        ffmpeg::codec_string(frame_width, frame_height, fps)
-    ));
-
-    let encoder = ffmpeg::choose_encoder(&ffmpeg_path);
-
-    let mut options = ffmpeg::Options {
-        ffmpeg: ffmpeg_path,
-        output: ffmpeg::Output::AnnexB,
-        gop: 60,
-        fragment_ms: 33,
-        profile: ffmpeg::Profile::High,
-        source: (screen_width.max(1) as usize, screen_height.max(1) as usize),
-        output_index,
-        offset,
-        capture: ffmpeg::capture_from_env(),
-        encoder,
-        width: frame_width,
-        height: frame_height,
-        fps,
-        bitrate_kbps,
-    };
-
-    let mut failures = 0u32;
-
-    loop {
-        // Encoding runs continuously, so stop it when nobody is watching.
-        if state.generation() != generation {
-            return;
-        }
-
-        while state.h264_clients() == 0 {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-
-        state.reset_h264_recent();
-
-        let mut encoder = match ffmpeg::Encoder::spawn(&options) {
-            Ok(encoder) => encoder,
-            Err(error) => {
-                eprintln!("{error}");
-                return;
-            }
-        };
-
-        let mut splitter = h264::Splitter::new();
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut units = 0u64;
-
-        loop {
-            if state.generation() != generation {
-                return;
-            }
-
-            if state.h264_clients() == 0 {
-                break;
-            }
-
-            match encoder.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    for unit in splitter.push(&buffer[..read]) {
-                        units += 1;
-                        state.publish_access_unit(Arc::new(unit));
-                    }
-                }
-                Err(error) => {
-                    eprintln!("encoder read failed: {error}");
-                    break;
-                }
-            }
-        }
-
-        for unit in splitter.finish() {
-            state.publish_access_unit(Arc::new(unit));
-        }
-
-        if units == 0 && state.generation() == generation {
-            explain(&encoder, "H.264");
-
-            // Desktop duplication is unavailable on some machines (virtual machines, basic
-            // display adapters). GDI needs no D3D11 at all, so it is worth one retry before
-            // giving up.
-            if options.capture == ffmpeg::Capture::Desktop {
-                options.capture = ffmpeg::Capture::Gdi;
-                eprintln!("capture: desktop duplication unavailable, falling back to GDI (slower)");
-                drop(encoder);
-                continue;
-            }
-        }
-
-        drop(encoder);
-        pause(&mut failures);
-    }
-}
-
 /// Runs ffmpeg and pushes every access unit to the WebRTC viewers.
 fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: u32, bitrate_kbps: u32, profile: ffmpeg::Profile, output_index: u32, offset: (i32, i32), ffmpeg_path: PathBuf, generation: u64) {
     let (screen_width, screen_height) = source;
@@ -1478,6 +1307,8 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        state.set_capturing(Some(options.output_index));
+
         let mut encoder = match ffmpeg::Encoder::spawn(&options) {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -1515,17 +1346,14 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
         }
 
         if units == 0 && state.generation() == generation {
-            explain(&encoder, "WebRTC");
-
-            // Desktop duplication is unavailable on some machines (virtual machines, basic
-            // display adapters). GDI needs no D3D11 at all, so it is worth one retry before
-            // giving up.
-            if options.capture == ffmpeg::Capture::Desktop {
-                options.capture = ffmpeg::Capture::Gdi;
-                eprintln!("capture: desktop duplication unavailable, falling back to GDI (slower)");
+            // Try the next capture strategy before reporting a failure.
+            if let Some(reason) = next_capture(&mut options) {
+                eprintln!("capture: {reason}");
                 drop(encoder);
                 continue;
             }
+
+            explain(&encoder, "WebRTC");
         }
 
         drop(encoder);
@@ -1534,6 +1362,290 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
 }
 
 /// Runs ffmpeg in fragmented MP4 mode and forwards whole fragments to the viewers.
+/// Prints what ffmpeg complained about, which is where the reason for a failure lives.
+fn explain(encoder: &ffmpeg::Encoder, what: &str) {
+    let error = encoder.last_error();
+
+    if error.trim().is_empty() {
+        eprintln!("{what}: the encoder stopped without producing anything");
+    } else {
+        eprintln!("{what}: the encoder stopped: {error}");
+    }
+}
+
+/// Waits before trying again, backing off so a broken setup does not spin at full speed.
+fn pause(failures: &mut u32) {
+    *failures += 1;
+
+    let seconds = 2u64.pow((*failures).min(5));
+    eprintln!("retrying in {seconds}s");
+    std::thread::sleep(Duration::from_secs(seconds));
+}
+
+/// The next capture strategy to try after a start produced nothing, or None when there is none
+/// left: desktop duplication for the chosen monitor, then GDI, then any monitor that works.
+fn next_capture(options: &mut ffmpeg::Options) -> Option<String> {
+    match options.capture {
+        ffmpeg::Capture::Desktop => {
+            options.capture = ffmpeg::Capture::Gdi;
+            Some("desktop duplication unavailable, falling back to GDI (slower)".to_string())
+        }
+        ffmpeg::Capture::Gdi => {
+            let wanted = options.output_index;
+            let working = crate::capture::working_output_index()?;
+
+            if working == wanted {
+                return None;
+            }
+
+            let monitors = Duplicator::outputs();
+            let monitor = monitors.iter().find(|output| output.index == working)?;
+
+            options.capture = ffmpeg::Capture::Desktop;
+            options.output_index = working;
+            options.offset = (monitor.left, monitor.top);
+            options.source = (monitor.width as usize, monitor.height as usize);
+
+            Some(format!(
+                "monitor {wanted} cannot be captured at all, using monitor {working} instead"
+            ))
+        }
+    }
+}
+
+/// Starts the encoder the current settings ask for.
+fn encode_for(state: Arc<State>, settings: Settings, generation: u64) {
+    // The chosen monitor, as a rectangle: its own size (not the primary one) and where it sits,
+    // which is what GDI capture needs when desktop duplication is unavailable.
+    let monitors = Duplicator::outputs();
+    let monitor = settings
+        .screen
+        .and_then(|index| monitors.iter().find(|output| output.index == index));
+
+    let (source_width, source_height) = match monitor {
+        Some(output) => (output.width as usize, output.height as usize),
+        None => {
+            let (width, height) = sys::screen_size();
+            (width.max(1) as usize, height.max(1) as usize)
+        }
+    };
+
+    let offset = monitor
+        .map(|output| (output.left, output.top))
+        .unwrap_or((0, 0));
+
+    // Zero means native: the screen's own height, so the scaler has nothing to do.
+    let height = if settings.height == 0 {
+        source_height
+    } else {
+        settings.height.min(source_height)
+    };
+
+    let fps = settings.fps;
+    let quality = settings.quality;
+
+    // The chosen monitor, or whichever one can be duplicated when the choice is automatic.
+    let output_index = settings
+        .screen
+        .unwrap_or_else(|| crate::capture::working_output_index().unwrap_or(0));
+
+    match &settings.mode {
+        Mode::Mjpeg { subsampling } => produce(
+            state,
+            height,
+            fps,
+            quality,
+            *subsampling,
+            settings.screen,
+            generation,
+        ),
+        Mode::H264 {
+            bitrate_kbps,
+            ffmpeg,
+        } => encode_h264(
+            state,
+            (source_width, source_height),
+            height,
+            fps,
+            *bitrate_kbps,
+            output_index,
+            offset,
+            ffmpeg.clone(),
+            generation,
+        ),
+        Mode::Mse {
+            bitrate_kbps,
+            gop,
+            fragment_ms,
+            ffmpeg,
+        } => encode_mse(
+            state,
+            (source_width, source_height),
+            height,
+            fps,
+            *bitrate_kbps,
+            *gop,
+            *fragment_ms,
+            output_index,
+            offset,
+            ffmpeg.clone(),
+            generation,
+        ),
+        Mode::WebRtc {
+            bitrate_kbps,
+            profile,
+            ffmpeg,
+        } => {
+            // What the offer advertises has to describe the stream we send, and that depends on
+            // the resolution the panel picked.
+            let (frame_width, frame_height) =
+                scaler::target_size(source_width, source_height, height);
+            let (_, level_hex) = ffmpeg::level_for(frame_width, frame_height, fps);
+            let advertised = format!("{}{level_hex}", profile.sdp_prefix());
+
+            let hub = match state.hub() {
+                Some(hub) => hub,
+                None => {
+                    let Some(hub) = webrtc_stream::Hub::new(advertised.clone(), fps) else {
+                        eprintln!("cannot start the WebRTC runtime");
+                        return;
+                    };
+
+                    state.set_hub(Arc::clone(&hub));
+                    hub
+                }
+            };
+
+            hub.set_profile_level_id(advertised);
+
+            encode_webrtc(
+                state,
+                (source_width, source_height),
+                height,
+                fps,
+                *bitrate_kbps,
+                *profile,
+                output_index,
+                offset,
+                ffmpeg.clone(),
+                generation,
+            )
+        }
+    }
+}
+
+/// Runs ffmpeg in Annex-B mode and hands whole access units to the WebCodecs page.
+fn encode_h264(
+    state: Arc<State>,
+    source: (usize, usize),
+    height: usize,
+    fps: u32,
+    bitrate_kbps: u32,
+    output_index: u32,
+    offset: (i32, i32),
+    ffmpeg_path: PathBuf,
+    generation: u64,
+) {
+    let (screen_width, screen_height) = source;
+    let (frame_width, frame_height) =
+        scaler::target_size(screen_width.max(1), screen_height.max(1), height);
+
+    state.set_frame_size(frame_width, frame_height);
+    state.set_h264_config(format!(
+        "{{\"h264\":{{\"codec\":\"{}\",\"width\":{frame_width},\"height\":{frame_height},\"fps\":{fps}}}}}",
+        ffmpeg::codec_string(frame_width, frame_height, fps)
+    ));
+
+    let encoder = ffmpeg::choose_encoder(&ffmpeg_path);
+
+    let mut options = ffmpeg::Options {
+        ffmpeg: ffmpeg_path,
+        output: ffmpeg::Output::AnnexB,
+        gop: 60,
+        fragment_ms: 16,
+        profile: ffmpeg::Profile::High,
+        source: (screen_width.max(1), screen_height.max(1)),
+        output_index,
+        offset,
+        capture: ffmpeg::capture_from_env(),
+        encoder,
+        width: frame_width,
+        height: frame_height,
+        fps,
+        bitrate_kbps,
+    };
+
+    let mut failures = 0u32;
+
+    loop {
+        if state.generation() != generation {
+            return;
+        }
+
+        while state.h264_clients() == 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        state.reset_h264_recent();
+        state.set_capturing(Some(options.output_index));
+
+        let mut encoder = match ffmpeg::Encoder::spawn(&options) {
+            Ok(encoder) => encoder,
+            Err(error) => {
+                eprintln!("{error}");
+                return;
+            }
+        };
+
+        let mut splitter = h264::Splitter::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut units = 0u64;
+
+        loop {
+            if state.generation() != generation {
+                return;
+            }
+
+            if state.h264_clients() == 0 {
+                break;
+            }
+
+            match encoder.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    for unit in splitter.push(&buffer[..read]) {
+                        units += 1;
+                        state.publish_access_unit(Arc::new(unit));
+                    }
+                }
+                Err(error) => {
+                    eprintln!("encoder read failed: {error}");
+                    break;
+                }
+            }
+        }
+
+        // Whatever the splitter still holds when ffmpeg stops.
+        for unit in splitter.finish() {
+            units += 1;
+            state.publish_access_unit(Arc::new(unit));
+        }
+
+        if units == 0 && state.generation() == generation {
+            // Try the next capture strategy before reporting a failure.
+            if let Some(reason) = next_capture(&mut options) {
+                eprintln!("capture: {reason}");
+                drop(encoder);
+                continue;
+            }
+
+            explain(&encoder, "H.264");
+        }
+
+        drop(encoder);
+        pause(&mut failures);
+    }
+}
 fn encode_mse(state: Arc<State>, source: (usize, usize), height: usize, fps: u32, bitrate_kbps: u32, gop: u32, fragment_ms: u32, output_index: u32, offset: (i32, i32), ffmpeg_path: PathBuf, generation: u64) {
     let (screen_width, screen_height) = source;
     let (frame_width, frame_height) = scaler::target_size(
@@ -1580,6 +1692,8 @@ fn encode_mse(state: Arc<State>, source: (usize, usize), height: usize, fps: u32
 
         state.reset_mse();
 
+        state.set_capturing(Some(options.output_index));
+
         let mut encoder = match ffmpeg::Encoder::spawn(&options) {
             Ok(encoder) => encoder,
             Err(error) => {
@@ -1618,14 +1732,13 @@ fn encode_mse(state: Arc<State>, source: (usize, usize), height: usize, fps: u32
         }
 
         if chunks == 0 && state.generation() == generation {
-            explain(&encoder, "MSE");
-
-            if options.capture == ffmpeg::Capture::Desktop {
-                options.capture = ffmpeg::Capture::Gdi;
-                eprintln!("capture: desktop duplication unavailable, falling back to GDI (slower)");
+            if let Some(reason) = next_capture(&mut options) {
+                eprintln!("capture: {reason}");
                 drop(encoder);
                 continue;
             }
+
+            explain(&encoder, "MSE");
         }
 
         drop(encoder);
@@ -1633,7 +1746,7 @@ fn encode_mse(state: Arc<State>, source: (usize, usize), height: usize, fps: u32
     }
 }
 
-fn produce(state: Arc<State>, source: (usize, usize), height: usize, fps: u32, ceiling: i32, subsampling: crate::jpeg::Subsampling, screen: Option<u32>, generation: u64) {
+fn produce(state: Arc<State>, height: usize, fps: u32, ceiling: i32, subsampling: crate::jpeg::Subsampling, screen: Option<u32>, generation: u64) {
     let mut duplicator = match Duplicator::new_at(screen) {
         Ok(duplicator) => duplicator,
         Err(error) => {
@@ -1649,6 +1762,19 @@ fn produce(state: Arc<State>, source: (usize, usize), height: usize, fps: u32, c
             return;
         }
     };
+
+    // Which monitor this ended up being: not always the requested one, because a monitor the GPU
+    // refuses to duplicate cannot be captured by this path at all.
+    let capturing = duplicator.output_index();
+    state.set_capturing(Some(capturing));
+
+    if let Some(wanted) = screen {
+        if wanted != capturing {
+            eprintln!(
+                "capture: monitor {wanted} cannot be duplicated, capturing monitor {capturing} instead"
+            );
+        }
+    }
 
     let (frame_width, frame_height) = scaler::target_size(screen_width, screen_height, height);
     state.set_frame_size(frame_width, frame_height);
@@ -1812,4 +1938,77 @@ fn prime(duplicator: &mut Duplicator) -> Result<(usize, usize), CaptureError> {
     Err(CaptureError::Message(
         "no frame arrived within 3 seconds".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cursor_in_frame;
+
+    #[test]
+    fn the_primary_monitor_is_the_identity_at_native_size() {
+        let primary = (0, 0, 2560, 1600);
+
+        assert_eq!(
+            cursor_in_frame((1280, 800), primary, (2560, 1600)),
+            Some((1280, 800))
+        );
+    }
+
+    #[test]
+    fn a_scaled_frame_still_maps_the_whole_monitor() {
+        let primary = (0, 0, 2560, 1600);
+
+        assert_eq!(
+            cursor_in_frame((1280, 800), primary, (1280, 800)),
+            Some((640, 400))
+        );
+        assert_eq!(
+            cursor_in_frame((2559, 1599), primary, (1280, 800)),
+            Some((1279, 799))
+        );
+    }
+
+    #[test]
+    fn a_second_monitor_is_mapped_relative_to_its_own_origin() {
+        // The secondary monitor starts where the primary ends; without subtracting it, a pointer
+        // at the far left of that screen would land at the frame's right edge.
+        let secondary = (2560, 0, 2560, 1440);
+
+        assert_eq!(
+            cursor_in_frame((2560, 0), secondary, (2560, 1440)),
+            Some((0, 0))
+        );
+        assert_eq!(
+            cursor_in_frame((2560 + 100, 200), secondary, (2560, 1440)),
+            Some((100, 200))
+        );
+    }
+
+    #[test]
+    fn a_pointer_on_another_monitor_maps_to_nothing() {
+        let secondary = (2560, 0, 2560, 1440);
+
+        assert_eq!(cursor_in_frame((100, 100), secondary, (2560, 1440)), None);
+        assert_eq!(
+            cursor_in_frame((2560 + 2560, 0), secondary, (2560, 1440)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_monitor_above_the_primary_works() {
+        // Negative coordinates are legal in a virtual desktop, and a sign error here would hide
+        // the pointer whenever the shared screen is positioned left of or above the primary.
+        let above = (0, -1080, 1920, 1080);
+
+        assert_eq!(
+            cursor_in_frame((960, -1080), above, (1920, 1080)),
+            Some((960, 0))
+        );
+    }
+
+    #[test]
+    fn a_frame_without_a_size_maps_to_nothing() {
+        assert_eq!(cursor_in_frame((10, 10), (0, 0, 2560, 1600), (0, 0)), None);
+    }
 }

@@ -148,23 +148,6 @@ pub struct Rect {
     pub bottom: i32,
 }
 
-#[repr(C)]
-#[derive(Default)]
-pub struct Rational {
-    pub numerator: u32,
-    pub denominator: u32,
-}
-
-#[repr(C)]
-#[derive(Default)]
-pub struct ModeDescription {
-    pub width: u32,
-    pub height: u32,
-    pub refresh_rate: Rational,
-    pub format: u32,
-    pub scanline_ordering: u32,
-    pub scaling: u32,
-}
 
 /// DXGI_OUTPUT_DESC, 96 bytes on x64.
 #[repr(C)]
@@ -255,11 +238,18 @@ fn export<T: Copy>(module: &str, name: &[u8]) -> Option<T> {
     Some(unsafe { std::mem::transmute_copy::<Pointer, T>(&address) })
 }
 
-/// The pointer position, in the same coordinate space as [`screen_size`].
+/// The pointer position in physical pixels.
+///
+/// `GetPhysicalCursorPos` matters here: DXGI reports monitor rectangles in physical pixels, and
+/// this program is DPI unaware, so `GetCursorPos` would come back in a scaled space and every
+/// cursor would be off by the scaling factor on a high DPI screen.
 pub fn cursor_position() -> Option<(i32, i32)> {
     static FUNCTION: OnceLock<Option<GetCursorPosFn>> = OnceLock::new();
 
-    let function = match *FUNCTION.get_or_init(|| export("user32.dll", b"GetCursorPos\0")) {
+    let function = match *FUNCTION.get_or_init(|| {
+        export("user32.dll", b"GetPhysicalCursorPos\0")
+            .or_else(|| export("user32.dll", b"GetCursorPos\0"))
+    }) {
         Some(function) => function,
         None => return None,
     };

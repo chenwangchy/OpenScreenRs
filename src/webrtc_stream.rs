@@ -316,7 +316,11 @@ async fn run_viewer(
         candidates.len(),
         candidates.join(", ")
     );
-    eprintln!("webrtc[{id}]: {setup}, answer codecs: {}", codecs.join(" | "));
+    eprintln!(
+        "webrtc[{id}]: answer {} bytes, {setup}, answer codecs: {}",
+        answer.len(),
+        codecs.join(" | ")
+    );
 
     if codecs.is_empty() {
         // No codec at all means the receiver rejected the media section; the SDP says why.

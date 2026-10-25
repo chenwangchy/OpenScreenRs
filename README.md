@@ -185,6 +185,16 @@ cargo test --release                          # 校验 H.264 码流切分
 | `--mse` | 关 | H.264 用 MediaSource 播放，**`http://IP` 可直接看**（WebCodecs 则要求 localhost/HTTPS） |
 | `--ffmpeg` | 自动找 | ffmpeg.exe 路径；依次找该参数、`OPENSCREEN_FFMPEG`、exe 同级目录、`PATH` |
 
+### 已经修掉的坑（都有实测依据）
+
+| 问题 | 症状 | 修法 |
+|---|---|---|
+| 主屏不能复制 | 选主屏黑屏/静止 | 抓屏阶梯：桌面复制 → GDI → 换一块能抓的屏 |
+| GDI 坐标硬编码 | 多屏/缩放/4K 下 GDI 抓空 | 用 DXGI 报告的**该屏真实矩形**（位置+物理像素） |
+| 掉线的观看端不回收 | 编码器为空会话空转 | WS 看门狗：10s 读超时 + ping，3 次无回应即断开 |
+| 启动瞬间连入拿不到 offer | 页面卡在 connecting | Hub 在启动时创建；页面信令失败会重试 5 次 |
+| 抓的屏和选的不一致 | 用户以为选错了 | `/settings` 返回 `capturing`，面板显示"实际抓取" |
+
 ### 依赖都在仓库里
 
 ```

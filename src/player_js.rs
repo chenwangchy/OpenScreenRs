@@ -77,7 +77,14 @@ pub const JS: &str = r##"(() => {
         let message = null;
         try { message = JSON.parse(event.data); } catch (error) { return; }
 
-        if (message.cursor) { position = message.cursor; place(); }
+        if (message.cursor === null) {
+        // The pointer is on a monitor that is not being shared.
+        position = null;
+        pointer.style.display = 'none';
+      } else if (message.cursor) {
+        position = message.cursor;
+        place();
+      }
         if (message.cursorImage) { pendingShape = message.cursorImage; }
         return;
       }

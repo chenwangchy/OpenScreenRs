@@ -39,6 +39,7 @@ pub const PAGE: &str = r##"<!doctype html>
   let peer = null;
   let socket = null;
   let offerSeen = false;
+  let attempts = 0;
 
 
   function report(text) {
@@ -111,6 +112,7 @@ pub const PAGE: &str = r##"<!doctype html>
     } catch (error) { }
   }
   async function connect() {
+    offerSeen = false;
     peer = new RTCPeerConnection({ iceServers: [] });
 
     peer.ontrack = (event) => {
@@ -155,8 +157,17 @@ pub const PAGE: &str = r##"<!doctype html>
       }
     };
 
+    // The server creates the transport at startup, but a restart or a dropped connection should
+    // not leave the page dead: signalling is one cheap round trip, so retry a few times.
     socket.onclose = () => {
-      report('signalling closed');
+      attempts += 1;
+
+      if (attempts <= 5) {
+        report('reconnecting (' + attempts + '/' + 5 + ')');
+        setTimeout(connect, 1000 * attempts);
+      } else {
+        report('signalling closed');
+      }
     };
 
     // If nothing connects, say what that means instead of leaving a silent black page. The

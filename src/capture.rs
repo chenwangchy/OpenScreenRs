@@ -333,9 +333,6 @@ impl Duplicator {
             None
         }
     }
-    pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
 
     pub fn output_index(&self) -> u32 {
         self.output_index

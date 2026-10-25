@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 /// Fixed GUID from RFC 6455, appended to the client key before hashing.
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -127,6 +128,94 @@ pub fn text_payload(frame: &[u8]) -> Option<String> {
         .collect();
 
     String::from_utf8(body).ok()
+}
+
+/// A WebSocket ping. Browsers answer it with a pong without any script involved.
+pub fn send_ping(socket: &mut TcpStream) -> std::io::Result<()> {
+    // FIN + opcode 9, no payload: two bytes is a complete control frame.
+    socket.write_all(&[0x89, 0x00])?;
+    socket.flush()
+}
+
+/// Waits for the client to go away, noticing the ones that never say so.
+///
+/// A viewer that loses WiFi never closes its socket: the read blocks forever, the connection
+/// leaks a thread and the encoder keeps running for nobody. Pings fix that, because every
+/// browser answers them automatically; three unanswered ones mean the client is gone.
+pub fn watch<F: FnMut(&[u8])>(socket: &mut TcpStream, mut on_data: F) {
+    let _ = socket.set_read_timeout(Some(Duration::from_secs(10)));
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut scratch = [0u8; 16 * 1024];
+    let mut quiet = 0;
+
+    loop {
+        match std::io::Read::read(socket, &mut scratch) {
+            Ok(0) => return,
+            Ok(read) => {
+                quiet = 0;
+                pending.extend_from_slice(&scratch[..read]);
+
+                // Hand over whole frames only. An answer SDP is a couple of kilobytes and TCP is
+                // free to deliver it in pieces, so a partially received frame must wait.
+                while let Some(total) = frame_length(&pending) {
+                    if pending.len() < total {
+                        break;
+                    }
+
+                    let frame: Vec<u8> = pending.drain(..total).collect();
+                    on_data(&frame);
+                }
+
+                if pending.len() > 1024 * 1024 {
+                    // Nothing a viewer sends is this big; do not let it grow without bound.
+                    return;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                quiet += 1;
+
+                if quiet >= 3 || send_ping(socket).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Total length of the first frame in `buffer`, once its header is complete.
+fn frame_length(buffer: &[u8]) -> Option<usize> {
+    if buffer.len() < 2 {
+        return None;
+    }
+
+    let masked = buffer[1] & 0x80 != 0;
+    let mut total = 2;
+    let length = match buffer[1] & 0x7f {
+        126 => {
+            if buffer.len() < 4 {
+                return None;
+            }
+
+            total += 2;
+            u16::from_be_bytes([buffer[2], buffer[3]]) as usize
+        }
+        // 64 bit lengths are not something a viewer sends; wait for more instead of guessing.
+        127 => return None,
+        short => short as usize,
+    };
+
+    if masked {
+        total += 4;
+    }
+
+    Some(total + length)
 }
 
 /// The body of a request: whatever already followed the head, plus enough bytes to reach the
@@ -291,4 +380,47 @@ pub fn base64(data: &[u8]) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frame_length;
+
+    /// A masked text frame of `payload` bytes, the shape a browser sends an answer in.
+    fn masked_text(payload: usize) -> Vec<u8> {
+        let mut frame = vec![0x81, 0x80 | 126];
+        frame.extend_from_slice(&(payload as u16).to_be_bytes());
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+        frame.extend(std::iter::repeat(0u8).take(payload));
+        frame
+    }
+
+    #[test]
+    fn frame_length_counts_the_mask_and_the_extended_length() {
+        // 2 header + 2 extended length + 4 mask + payload
+        assert_eq!(frame_length(&masked_text(2000)), Some(2008));
+    }
+
+    #[test]
+    fn frame_length_waits_for_a_complete_header() {
+        assert_eq!(frame_length(&[]), None);
+        assert_eq!(frame_length(&[0x81]), None);
+        // extended length announced but not delivered yet
+        assert_eq!(frame_length(&[0x81, 0xfe]), None);
+        assert_eq!(frame_length(&[0x81, 0xfe, 0x07]), None);
+    }
+
+    #[test]
+    fn an_answer_split_over_two_reads_is_one_frame() {
+        let frame = masked_text(1500);
+
+        // The delivery boundary lands in the middle of the header, which is where a naive reader
+        // gives up and the viewer's answer is lost.
+        assert_eq!(frame_length(&frame[..3]), None);
+
+        // Once the header is there the length is known, and the watcher keeps reading until that
+        // many bytes have arrived: 2 header + 2 extended length + 4 mask + 1500 payload.
+        assert_eq!(frame_length(&frame[..1500]), Some(1508));
+        assert_eq!(frame.len(), 1508);
+    }
 }
