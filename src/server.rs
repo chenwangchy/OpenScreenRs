@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,8 @@ use crate::fmp4::{self, Chunk};
 use crate::h264::AccessUnit;
 use crate::jpeg::Encoder;
 use crate::{
-    cursor, ffmpeg, h264, h264_page, mjpeg, mse_page, page, panel_page, player_js, scaler, sys,
-    webrtc_page, webrtc_stream, ws,
+    cursor, ffmpeg, h264, h264_page, input, mjpeg, mse_page, page, panel_page, player_js, scaler,
+    sys, webrtc_page, webrtc_stream, ws,
 };
 
 const MIN_QUALITY: i32 = 50;
@@ -223,6 +223,13 @@ struct State {
     generation: AtomicU64,
     /// Which monitor is actually being captured, which is not always the requested one.
     capturing: Mutex<Option<u32>>,
+    /// Whether a viewer may move this machine's pointer and type on it. Off until the panel says
+    /// otherwise: sharing a picture is passive, driving somebody's keyboard is not.
+    control: AtomicBool,
+    /// Who is driving, for the panel and the console.
+    controller: Mutex<Option<String>>,
+    /// The keys and buttons a viewer holds down, so they can be released when it leaves.
+    input: Mutex<input::Session>,
 }
 
 impl State {
@@ -231,6 +238,9 @@ impl State {
             settings: Mutex::new(settings),
             generation: AtomicU64::new(1),
             capturing: Mutex::new(None),
+            control: AtomicBool::new(false),
+            controller: Mutex::new(None),
+            input: Mutex::new(input::Session::new()),
             shared: Mutex::new(Shared {
                 frame: None,
                 version: 0,
@@ -275,6 +285,107 @@ impl State {
 
     fn kind(&self) -> Kind {
         self.settings().mode.kind()
+    }
+
+    fn control(&self) -> bool {
+        self.control.load(Ordering::SeqCst)
+    }
+
+    fn controller(&self) -> Option<String> {
+        self.controller.lock().unwrap().clone()
+    }
+
+    /// The JSON every page uses to decide whether its clicks count.
+    fn control_message(&self) -> String {
+        let controller = match self.controller() {
+            Some(who) => format!("\"{}\"", who.replace('"', "")),
+            None => "null".to_string(),
+        };
+
+        format!(
+            "{{\"control\":{},\"controller\":{controller}}}",
+            self.control()
+        )
+    }
+
+    /// Turns remote control on or off. Turning it off also lets go of anything the viewer is
+    /// holding down, which is the difference between a finished session and a stuck Ctrl key.
+    fn set_control(&self, on: bool) {
+        if !on {
+            self.input.lock().unwrap().release();
+            *self.controller.lock().unwrap() = None;
+        }
+
+        self.control.store(on, Ordering::SeqCst);
+
+        println!(
+            "remote control: {}",
+            if on {
+                "on — a viewer can use the pointer and the keyboard"
+            } else {
+                "off"
+            }
+        );
+
+        self.announce_control();
+    }
+
+    /// Records who is driving and tells the pages. Refuses once control has been turned off.
+    fn claim_control(&self, who: &str) -> bool {
+        if !self.control() {
+            return false;
+        }
+
+        let mut controller = self.controller.lock().unwrap();
+
+        if controller.as_deref() == Some(who) {
+            return true;
+        }
+
+        println!("remote control: {who} is using this machine");
+        *controller = Some(who.to_string());
+        drop(controller);
+
+        self.announce_control();
+        true
+    }
+
+    /// Forgets a viewer that went away, releasing whatever it left held down.
+    fn release_control(&self, who: &str) {
+        let mut controller = self.controller.lock().unwrap();
+
+        if controller.as_deref() != Some(who) {
+            return;
+        }
+
+        *controller = None;
+        drop(controller);
+
+        self.input.lock().unwrap().release();
+        println!("remote control: {who} stopped");
+
+        self.announce_control();
+    }
+
+    /// Applies one input message from `who`, if that viewer is the one allowed to drive.
+    fn inject(&self, who: &str, message: &str) {
+        if !self.claim_control(who) {
+            return;
+        }
+
+        // Not every message the page sends is understood, so an unknown one is simply dropped.
+        let shared = self.capturing();
+        self.input.lock().unwrap().apply(message, shared);
+    }
+
+    /// Tells every page whether it may send input.
+    fn announce_control(&self) {
+        let message = self.control_message();
+
+        let mut shared = self.shared.lock().unwrap();
+        shared
+            .cursor_clients
+            .retain_mut(|client| ws::send_text(&mut client.stream, message.as_bytes()).is_ok());
     }
 
     fn publish(&self, jpeg: Vec<u8>) {
@@ -396,8 +507,13 @@ impl State {
         });
     }
 
-    /// Registers a page and sends it the current pointer position right away.
+    /// Registers a page, telling it straight away whether it may send input and where the pointer is.
     fn register_cursor_client(&self, mut stream: TcpStream) -> std::io::Result<u64> {
+        // Built before the lock: it reads another lock, and taking two locks in a different order
+        // in two places is how a deadlock gets in.
+        let control = self.control_message();
+        ws::send_text(&mut stream, control.as_bytes())?;
+
         let mut shared = self.shared.lock().unwrap();
         let id = shared.next_cursor_client;
         shared.next_cursor_client += 1;
@@ -650,6 +766,10 @@ fn print_addresses(port: u16) {
 
 /// Starts serving. `height` is the frame height, the width follows the screen aspect ratio.
 pub fn run(port: u16, height: usize, fps: u32, quality: i32, ffmpeg: PathBuf, mode: Mode) -> Result<(), String> {
+    // Before anything reads a size: at 125% scaling Windows otherwise describes this desktop as
+    // 2048x1280, which caps the frame height and puts every injected pointer 20% off.
+    sys::become_dpi_aware();
+
     // A height of zero means native: every later stage compares against the source size, so
     // passing the screen's own height is what makes the scaler skip its work entirely.
     //
@@ -699,6 +819,7 @@ pub fn run(port: u16, height: usize, fps: u32, quality: i32, ffmpeg: PathBuf, mo
     // usually virtual adapters from WSL, VMware or a hotspot as well.
     print_addresses(port);
     println!("open that address in a browser to change the settings");
+    println!("remote control is off; turn it on in the panel, or type x + Enter here to stop it");
 
     // Creating the transport up front closes a race: a page that connects in the first moments
     // would find no hub, receive no offer, and sit there with a dead panel.
@@ -738,6 +859,24 @@ pub fn run(port: u16, height: usize, fps: u32, quality: i32, ffmpeg: PathBuf, mo
         std::thread::spawn(move || track_cursor(cursor_state));
     }
 
+    // A way out that does not need a browser: the panel is one tab among many, and a viewer that
+    // has the pointer should be stoppable from the window in front of the person being watched.
+    {
+        let stopper = Arc::clone(&state);
+
+        std::thread::spawn(move || {
+            let mut line = String::new();
+
+            while std::io::stdin().read_line(&mut line).is_ok_and(|read| read > 0) {
+                if line.trim().eq_ignore_ascii_case("x") {
+                    stopper.set_control(false);
+                }
+
+                line.clear();
+            }
+        });
+    }
+
     for connection in listener.incoming() {
         let socket = match connection {
             Ok(socket) => socket,
@@ -774,6 +913,7 @@ fn handle_connection(state: Arc<State>, mut socket: TcpStream) {
         "/" | "/index.html" => serve_page(&mut socket, panel_page::PAGE),
         "/view" => serve_page(&mut socket, home(&state)),
         "/settings" => serve_settings(state, socket, &request),
+        "/control" => serve_control(state, socket, &request),
         "/h264" => serve_page(&mut socket, h264_page::PAGE),
         "/h264/ws" => serve_h264_channel(state, socket, &request),
         "/mse" => serve_page(&mut socket, mse_page::PAGE),
@@ -806,6 +946,26 @@ fn serve_script(socket: &mut TcpStream) {
     let _ = socket.flush();
 }
 
+/// Turns remote control on or off.
+///
+/// Deliberately not part of the settings form: those restart the encoder, and flipping a switch
+/// should not cost the viewer its connection.
+fn serve_control(state: Arc<State>, mut socket: TcpStream, request: &str) {
+    if request.starts_with("POST") {
+        let body = ws::body(&mut socket, request).unwrap_or_default();
+        state.set_control(body.split('&').any(|pair| pair.trim() == "on=1"));
+    }
+
+    let body = state.control_message();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let _ = socket.write_all(response.as_bytes());
+}
+
 /// Reads the settings as JSON, or applies a form post and asks for a new encoder.
 fn serve_settings(state: Arc<State>, mut socket: TcpStream, request: &str) {
     let settings = state.settings();
@@ -832,7 +992,7 @@ fn serve_settings(state: Arc<State>, mut socket: TcpStream, request: &str) {
             .collect();
 
         let body = format!(
-            "{{\"mode\":\"{}\",\"height\":{},\"fps\":{},\"bitrate\":{},\"quality\":{},\"profile\":\"{}\",\"screen\":{},\"capturing\":{},\"viewers\":{},\"generation\":{},\"addresses\":[{}],\"screens\":[{}]}}",
+            "{{\"mode\":\"{}\",\"height\":{},\"fps\":{},\"bitrate\":{},\"quality\":{},\"profile\":\"{}\",\"screen\":{},\"capturing\":{},\"viewers\":{},\"generation\":{},\"control\":{},\"controller\":{},\"addresses\":[{}],\"screens\":[{}]}}",
             match settings.mode {
                 Mode::Mjpeg { .. } => "mjpeg",
                 Mode::H264 { .. } => "h264",
@@ -858,6 +1018,11 @@ fn serve_settings(state: Arc<State>, mut socket: TcpStream, request: &str) {
             },
             state.viewers() + state.h264_clients() + state.mse_clients() + state.hub().map(|hub| hub.viewers()).unwrap_or(0),
             state.generation(),
+            state.control(),
+            match state.controller() {
+                Some(who) => format!("\"{who}\""),
+                None => "null".to_string(),
+            },
             addresses.join(","),
             screens.join(",")
         );
@@ -1026,6 +1191,8 @@ fn serve_page(socket: &mut TcpStream, content: &str) {
     let _ = socket.flush();
 }
 
+/// The page's side channel: pointer shape and position out, and — once the panel allows it — the
+/// viewer's own pointer and keyboard in.
 fn serve_cursor_channel(state: Arc<State>, mut socket: TcpStream, request: &str) {
     let upgraded = ws::handshake(&mut socket, request).unwrap_or(false);
 
@@ -1044,9 +1211,22 @@ fn serve_cursor_channel(state: Arc<State>, mut socket: TcpStream, request: &str)
         Err(_) => return,
     };
 
-    // Nothing is expected from the page; reading only tells us when it goes away.
-    ws::watch(&mut socket, |_| {});
+    // Whose input this is: the panel shows it, and the console says it out loud.
+    let who = socket
+        .peer_addr()
+        .map(|address| address.ip().to_string())
+        .unwrap_or_default();
 
+    let channel = Arc::clone(&state);
+    let from = who.clone();
+
+    ws::watch(&mut socket, move |frame| {
+        if let Some(message) = ws::text_payload(frame) {
+            channel.inject(&from, &message);
+        }
+    });
+
+    state.release_control(&who);
     state.unregister_cursor_client(id);
 }
 

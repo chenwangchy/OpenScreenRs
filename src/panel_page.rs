@@ -37,6 +37,7 @@ pub const PAGE: &str = r##"<!doctype html>
   select, input { background: #23262e; color: #e6e6e6; border: 1px solid #333844;
                   border-radius: 7px; padding: 7px 9px; font: inherit; min-width: 150px; }
   select:disabled, input:disabled { opacity: .45; }
+  input[type=checkbox] { min-width: auto; width: 18px; height: 18px; accent-color: #2f6fd0; }
   .hint { font-size: 12px; color: #8b93a1; margin: -6px 0 10px; }
   .actions { display: flex; gap: 10px; align-items: center; }
   button.primary { flex: 1; padding: 12px; border-radius: 9px; border: 0; cursor: pointer;
@@ -108,6 +109,15 @@ pub const PAGE: &str = r##"<!doctype html>
   </section>
 
   <section>
+    <h2>远程控制</h2>
+    <label class="row"><span>允许观看端操作这台电脑</span>
+      <input id="control" type="checkbox">
+    </label>
+    <div id="controller" class="hint">未开启：观看端只能看画面。</div>
+    <div class="hint">在运行窗口里输入 x 回车可以立刻断开。这条通道还没有密码，请只在可信的局域网里开启。</div>
+  </section>
+
+  <section>
     <div class="actions">
       <button class="primary" id="apply">应用设置</button>
       <a class="view" id="view" href="/view">打开画面</a>
@@ -133,6 +143,44 @@ pub const PAGE: &str = r##"<!doctype html>
   const address = document.getElementById('address');
   const note = document.getElementById('note');
   const view = document.getElementById('view');
+  const controlBox = document.getElementById('control');
+  const controllerLine = document.getElementById('controller');
+
+  function describeControl(settings) {
+    if (!settings.control) return '未开启：观看端只能看画面。';
+
+    return settings.controller
+      ? '正在被 ' + settings.controller + ' 控制。'
+      : '已开启，等待观看端操作。';
+  }
+
+  controlBox.onchange = async () => {
+    const body = new URLSearchParams({ on: controlBox.checked ? '1' : '0' });
+
+    try {
+      const settings = await (await fetch('/control', { method: 'POST', body })).json();
+
+      controlBox.checked = !!settings.control;
+      controllerLine.textContent = describeControl(settings);
+      say(settings.control ? '已允许远程控制。' : '已关闭远程控制。', 'ok');
+    } catch (error) {
+      controlBox.checked = !controlBox.checked;
+      say('设置失败：' + error.message, 'bad');
+    }
+  };
+
+  // Only the control state is polled, so this cannot overwrite a setting half edited above. It is
+  // how the tab notices that somebody typed x in the console, or opened the panel twice.
+  async function refreshControl() {
+    try {
+      const settings = await (await fetch('/settings', { cache: 'no-store' })).json();
+
+      controlBox.checked = !!settings.control;
+      controllerLine.textContent = describeControl(settings);
+    } catch (error) {
+      // Already reported by whatever did the last real request.
+    }
+  }
 
   let current = 'webrtc';
 
@@ -227,6 +275,9 @@ pub const PAGE: &str = r##"<!doctype html>
 
     paint();
     showAddress();
+
+    controlBox.checked = !!settings.control;
+    controllerLine.textContent = describeControl(settings);
   }
 
   address.addEventListener('change', showAddress);
@@ -260,6 +311,7 @@ pub const PAGE: &str = r##"<!doctype html>
   };
 
   load().catch((error) => say('读不到设置：' + error.message, 'bad'));
+  setInterval(refreshControl, 3000);
 })();
 </script>
 </body>

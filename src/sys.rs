@@ -231,7 +231,8 @@ pub struct Point {
 type GetCursorPosFn = unsafe extern "system" fn(*mut Point) -> i32;
 type GetSystemMetricsFn = unsafe extern "system" fn(i32) -> i32;
 
-fn export<T: Copy>(module: &str, name: &[u8]) -> Option<T> {
+/// Looks up a function by name and returns it as the requested signature.
+pub(crate) fn export<T: Copy>(module: &str, name: &[u8]) -> Option<T> {
     let library = load_library(module)?;
     let address = symbol(library, name)?;
 
@@ -503,18 +504,70 @@ unsafe fn wide_text(pointer: *const u16) -> String {
     String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length))
 }
 
-/// The screen size in the same coordinate space as [`cursor_position`].
-///
-/// This program has no DPI manifest, so both come back in the same virtualised space; the
-/// cursor can therefore be mapped onto the frame with a single ratio.
-pub fn screen_size() -> (i32, i32) {
+/// One `GetSystemMetrics` value.
+fn metric(index: i32) -> i32 {
     static FUNCTION: OnceLock<Option<GetSystemMetricsFn>> = OnceLock::new();
 
-    let function = match *FUNCTION.get_or_init(|| export("user32.dll", b"GetSystemMetrics\0")) {
-        Some(function) => function,
-        None => return (0, 0),
+    let Some(function) = *FUNCTION.get_or_init(|| export("user32.dll", b"GetSystemMetrics\0")) else {
+        return 0;
     };
 
+    unsafe { function(index) }
+}
+
+/// The primary screen size, in physical pixels once [`become_dpi_aware`] has run.
+///
+/// Without DPI awareness Windows reports a 2560x1600 desktop at 125% as 2048x1280, and that is
+/// where the frame height was silently capped. The pointer position and the DXGI monitor rectangles
+/// always came back in physical pixels, so this was the one that disagreed with them.
+pub fn screen_size() -> (i32, i32) {
     // SM_CXSCREEN = 0, SM_CYSCREEN = 1
-    unsafe { (function(0), function(1)) }
+    (metric(0), metric(1))
+}
+
+/// The whole virtual desktop as `SendInput` measures absolute positions: left, top, width, height.
+///
+/// Asked for from the same place `SendInput` asks, rather than assembled from the monitor
+/// rectangles. That is not the same thing: enumeration happens per adapter, so a machine with the
+/// integrated GPU driving one screen and the discrete one driving the other reports a bounding box
+/// Windows does not use, and every injected position lands at the wrong fraction of the desktop.
+pub fn virtual_screen() -> (i32, i32, i32, i32) {
+    // SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77,
+    // SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79
+    (metric(76), metric(77), metric(78), metric(79))
+}
+
+/// Makes this process DPI aware, so that the desktop is described in real pixels.
+///
+/// Without it every coordinate this program reads is scaled: Windows reports the 2560x1600 primary
+/// monitor as 2048x1280, and `SendInput` interprets absolute positions in that same virtualised
+/// space while DXGI reports monitor rectangles in physical pixels. Mixing the two puts the injected
+/// pointer at 80% of where it should be, which is exactly the kind of bug that only shows up on
+/// somebody else's high DPI laptop.
+///
+/// Called once, before anything reads a size.
+pub fn become_dpi_aware() {
+    type SetContextFn = unsafe extern "system" fn(Pointer) -> i32;
+    type SetAwarenessFn = unsafe extern "system" fn(i32) -> i32;
+    type SetAwareFn = unsafe extern "system" fn() -> i32;
+
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, Windows 10 1703 and later. Per monitor rather
+    // than per system, because a second screen of a different scale would otherwise be distorted.
+    if let Some(function) = export::<SetContextFn>("user32.dll", b"SetProcessDpiAwarenessContext\0") {
+        if unsafe { function((-4isize) as usize as Pointer) } != 0 {
+            return;
+        }
+    }
+
+    if let Some(function) = export::<SetAwarenessFn>("shcore.dll", b"SetProcessDpiAwareness\0") {
+        // PROCESS_PER_MONITOR_DPI_AWARE = 2
+        if unsafe { function(2) } == 0 {
+            return;
+        }
+    }
+
+    // What is left on Windows 7 and on processes that already had awareness set from a manifest.
+    if let Some(function) = export::<SetAwareFn>("user32.dll", b"SetProcessDPIAware\0") {
+        unsafe { function() };
+    }
 }

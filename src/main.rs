@@ -14,6 +14,7 @@ mod ffmpeg;
 mod fmp4;
 mod h264;
 mod h264_page;
+mod input;
 mod mse_page;
 mod jpeg;
 mod mjpeg;
