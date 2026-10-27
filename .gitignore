@@ -2,3 +2,7 @@
 /turbojpeg.dll
 /x64
 /x86
+
+# GitHub rejects any file over 100 MB and this one is 132 MB. It stays on disk — the packaging
+# script and target/build-release use it — but out of git; the README says where to get it again.
+/vendor/ffmpeg/ffmpeg.exe
