@@ -198,6 +198,13 @@ impl Session {
                 let down: u8 = parts.next()?.parse().ok()?;
                 self.key(code, down != 0)?;
             }
+            // `s <scancode> <extended> <down>`: what a native client's keyboard produces anyway.
+            // Passing the scan code through means neither side needs a layout table, and the host
+            // composes text with its own input method — candidate window and all.
+            "s" => {
+                let (scan, extended, down) = parse_raw_key(message)?;
+                self.raw(scan, extended, down)?;
+            }
             // `r`: the page lost focus and wants everything released.
             "r" => self.release(),
             _ => return None,
@@ -251,6 +258,14 @@ impl Session {
 
     fn key(&mut self, code: &str, down: bool) -> Option<()> {
         let (scan, extended) = scancode(code)?;
+        self.raw(scan, extended, down)
+    }
+
+    /// Injects one key by its scan code, remembering it so it can be released later.
+    fn raw(&mut self, scan: u16, extended: bool, down: bool) -> Option<()> {
+        if scan == 0 {
+            return None;
+        }
 
         if down {
             if !self.keys.contains(&(scan, extended)) {
@@ -281,6 +296,24 @@ impl Session {
             }
         }
     }
+}
+
+/// `s <scancode> <extended> <down>`, the key message a native client sends.
+///
+/// Split out so the format has one parser and one test: the wire format is the only contract
+/// between two separately built programs.
+fn parse_raw_key(message: &str) -> Option<(u16, bool, bool)> {
+    let mut parts = message.split(' ');
+
+    if parts.next()? != "s" {
+        return None;
+    }
+
+    let scan: u16 = parts.next()?.parse().ok()?;
+    let extended: u8 = parts.next()?.parse().ok()?;
+    let down: u8 = parts.next()?.parse().ok()?;
+
+    Some((scan, extended != 0, down != 0))
 }
 
 /// The pixel inside the virtual desktop that a 0..10000 fraction of the shared monitor means.
@@ -421,7 +454,7 @@ fn extended_scancode(code: &str) -> Option<(u16, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{absolute, place, scancode};
+    use super::{absolute, parse_raw_key, place, scancode};
 
     #[test]
     fn a_fraction_of_the_picture_lands_inside_the_shared_monitor() {
@@ -459,6 +492,18 @@ mod tests {
         assert_eq!(scancode("Numpad5"), Some((0x4C, false)));
         assert_eq!(scancode("ArrowUp"), Some((0x48, true)));
         assert_eq!(scancode("ControlRight"), Some((0x1D, true)));
+    }
+
+    #[test]
+    fn a_native_client_key_message_is_parsed() {
+        // `s <scancode> <extended> <down>`: 0x1E is A, 0x1D with the E0 prefix is right control.
+        assert_eq!(parse_raw_key("s 30 0 1"), Some((0x1E, false, true)));
+        assert_eq!(parse_raw_key("s 29 1 0"), Some((0x1D, true, false)));
+
+        // Anything else is not a key message, and must not be guessed at.
+        assert_eq!(parse_raw_key("s 30 0"), None);
+        assert_eq!(parse_raw_key("s x 0 1"), None);
+        assert_eq!(parse_raw_key("k KeyA 1"), None);
     }
 
     #[test]

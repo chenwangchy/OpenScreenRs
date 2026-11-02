@@ -7,7 +7,7 @@
 
 use std::sync::OnceLock;
 
-use crate::sys::{self, Pointer};
+use crate::sys::{self, BitmapInfo, BitmapInfoHeader, Pointer};
 
 const CURSOR_SHOWING: u32 = 1;
 const DIB_RGB_COLORS: u32 = 0;
@@ -45,29 +45,6 @@ struct Bitmap {
     bits: Pointer,
 }
 
-#[repr(C)]
-#[derive(Default)]
-struct BitmapInfoHeader {
-    size: u32,
-    width: i32,
-    height: i32,
-    planes: u16,
-    bit_count: u16,
-    compression: u32,
-    size_image: u32,
-    x_pixels_per_meter: i32,
-    y_pixels_per_meter: i32,
-    colours_used: u32,
-    colours_important: u32,
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct BitmapInfo {
-    header: BitmapInfoHeader,
-    colours: [u32; 3],
-}
-
 type GetCursorInfoFn = unsafe extern "system" fn(*mut CursorInfo) -> i32;
 type GetIconInfoFn = unsafe extern "system" fn(Pointer, *mut IconInfo) -> i32;
 type GetObjectWFn = unsafe extern "system" fn(Pointer, i32, *mut Bitmap) -> i32;
@@ -85,6 +62,7 @@ type ReleaseDCFn = unsafe extern "system" fn(Pointer, Pointer) -> i32;
 type DeleteObjectFn = unsafe extern "system" fn(Pointer) -> i32;
 
 /// Everything needed to draw the pointer: the pixels, and where the tip is.
+#[derive(Clone)]
 pub struct Shape {
     pub width: usize,
     pub height: usize,

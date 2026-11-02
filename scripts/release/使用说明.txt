@@ -151,7 +151,31 @@
   - 浏览器端：Chrome / Edge / Safari 较新版本即可
 
 
-八、开源组件与许可
+八、原生客户端（Windows 电脑看电脑）
+
+  除了浏览器，同一个 openscreen-rs.exe 还能直接当客户端用：画面在独立窗口里，
+  键盘直接给对面，中文输入法也能用（打字由对方的输入法组合，候选框就在画面里）。
+
+  用法一：双击「连接-对方电脑.bat」，按提示输入对方地址
+  用法二：命令行里
+          openscreen-rs.exe view 192.168.1.23
+          openscreen-rs.exe view 192.168.1.23:3035 --fullscreen
+          openscreen-rs.exe view 192.168.1.23 --decode-width 0
+
+  快捷键：F11 全屏；全屏时 Esc 退出；关掉窗口就断开。
+  标题栏一直显示：分辨率、帧率、解码耗时、延迟（rtt）。
+  标题栏里写「只读」= 对方还没在面板上勾「允许观看端操作这台电脑」。
+
+  注意：
+    - 对方必须用 WebRTC 或 H.264 模式启动（WebRTC 就是默认那个）。
+      MSE / MJPEG 模式没有这条通道，客户端会直接说明原因并退出。
+    - 客户端需要 ffmpeg.exe（发行包里已经带了，和程序放在同一目录即可）。
+    - Alt+Tab、Ctrl+Alt+Del 由本机系统截获，转发不过去。
+    - 解码默认按 1920 宽；想要原生清晰度用 --decode-width 0，但 1600p 时
+      解码数据量约 1 GB/s，机器要够快。
+
+
+九、开源组件与许可
 
   - ffmpeg.exe       FFmpeg（本包使用 LGPL 构建），见 licenses/ffmpeg-LICENSE.txt
                      源码：https://ffmpeg.org/ 与 https://github.com/BtbN/FFmpeg-Builds

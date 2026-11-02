@@ -109,9 +109,13 @@ pub const PAGE: &str = r##"<!doctype html>
       if (typeof event.data === 'string') {
         try {
           const message = JSON.parse(event.data);
-          if (message.config) {
-            configure(message.config);
-            status.textContent = 'connected (' + message.config.codec + ')';
+          // The server names the object after the mode, like `mse` does for the MediaSource page.
+          // Reading `config` here left the canvas black: the decoder was never configured.
+          const config = message.h264;
+
+          if (config) {
+            configure(config);
+            status.textContent = 'connected (' + config.codec + ')';
           }
         } catch (error) { }
         return;

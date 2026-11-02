@@ -10,11 +10,13 @@
 
 mod capture;
 mod cursor;
+mod decode;
 mod ffmpeg;
 mod fmp4;
 mod h264;
 mod h264_page;
 mod input;
+mod json;
 mod mse_page;
 mod jpeg;
 mod mjpeg;
@@ -24,8 +26,10 @@ mod player_js;
 mod scaler;
 mod server;
 mod sys;
+mod view;
 mod webrtc_page;
 mod webrtc_stream;
+mod window;
 mod ws;
 
 use std::error::Error;
@@ -113,12 +117,27 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", selftest());
             Ok(())
         }
+        // The native client: same binary, other side of the connection.
+        "view" => {
+            let Some(address) = positional(&args, &["--ffmpeg", "--decode-width"]) else {
+                return Err(
+                    "usage: openscreen-rs view <host[:port]> [--decode-width N] [--fullscreen]".into(),
+                );
+            };
+
+            let decode_width = number(&args, "--decode-width", 1920) as usize;
+            let fullscreen = flag(&args, "--fullscreen");
+
+            view::run(address, decode_width, fullscreen, ffmpeg_path(&args))
+                .map_err(|error| error.into())
+        }
         "info" => info(),
         _ => {
             println!("openscreen-rs");
             println!();
             println!("usage:");
             println!("  openscreen-rs serve [options]        stream to a browser");
+            println!("  openscreen-rs view <host[:port]>     connect as the native client");
             println!("  openscreen-rs selftest               check the WebSocket handshake");
             println!("  openscreen-rs info                  show desktop size and encoder status");
             println!("  openscreen-rs bench [options]        measure one frame end to end");
@@ -138,6 +157,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             println!("  --fragment-ms N  longest fragment for --mse; this is the latency floor (default 16)");
             println!("  --gop N       key frame interval for --mse, i.e. the recovery interval (default 60)");
             println!("  --ffmpeg P    path to ffmpeg.exe (default: next to this program, or PATH)");
+            println!("  --decode-width N  native client: decode at this width (default 1920, 0 = native)");
+            println!("  --fullscreen  native client: open the window fullscreen");
             Ok(())
         }
     }
@@ -313,6 +334,29 @@ fn profile(args: &[String]) -> ffmpeg::Profile {
 
 fn flag(args: &[String], name: &str) -> bool {
     args.iter().any(|argument| argument == name)
+}
+
+/// The first argument that is neither a flag nor the value of one, i.e. the host address.
+fn positional<'a>(args: &'a [String], valued: &[&str]) -> Option<&'a String> {
+    let mut skip_value = false;
+
+    for argument in args.iter().skip(1) {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+
+        if valued.contains(&argument.as_str()) {
+            skip_value = true;
+            continue;
+        }
+
+        if !argument.starts_with("--") {
+            return Some(argument);
+        }
+    }
+
+    None
 }
 
 /// Where ffmpeg lives: the flag, then the environment, then next to this program.

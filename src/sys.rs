@@ -140,7 +140,7 @@ pub unsafe fn query_interface(object: Pointer, id: &Guid) -> Option<Pointer> {
 
 /// A rectangle in screen coordinates, as COM passes it.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
@@ -191,6 +191,32 @@ pub struct MappedSubresource {
     pub depth_pitch: u32,
 }
 
+/// BITMAPINFOHEADER, the description GDI wants next to a block of pixels.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BitmapInfoHeader {
+    pub size: u32,
+    pub width: i32,
+    /// Negative for top down rows, which is the order both capture and decode produce.
+    pub height: i32,
+    pub planes: u16,
+    pub bit_count: u16,
+    pub compression: u32,
+    pub size_image: u32,
+    pub x_pixels_per_meter: i32,
+    pub y_pixels_per_meter: i32,
+    pub colours_used: u32,
+    pub colours_important: u32,
+}
+
+/// BITMAPINFO: the header plus the colour table, which 32 bit pixels never read.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BitmapInfo {
+    pub header: BitmapInfoHeader,
+    pub colours: [u32; 3],
+}
+
 // D3D11 constants used by the capture path.
 pub const D3D_DRIVER_TYPE_HARDWARE: u32 = 1;
 pub const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
@@ -222,7 +248,7 @@ pub fn end_period() {
 }
 /// A point in screen coordinates.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Point {
     pub x: i32,
     pub y: i32,

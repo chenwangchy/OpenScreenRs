@@ -539,8 +539,37 @@ impl State {
         shared.cursor_clients.retain(|client| client.id != id);
     }
 
+    /// Answers one page on its own channel, under the lock the cursor broadcasts use.
+    ///
+    /// The lock matters: two threads writing to one socket can interleave two frames, and what
+    /// arrives is neither of them.
+    fn reply_to_cursor_client(&self, id: u64, message: &str) {
+        let mut shared = self.shared.lock().unwrap();
+
+        shared.cursor_clients.retain_mut(|client| {
+            client.id != id || ws::send_text(&mut client.stream, message.as_bytes()).is_ok()
+        });
+    }
+
+    /// Updates what H.264 viewers are told about the stream, and tells the ones already connected:
+    /// a resolution change is a new decoder configuration for them too.
+    ///
+    /// The client list is kept on purpose. Dropping it here would leave those viewers connected to
+    /// a socket that never carries another frame, which on their side looks exactly like a frozen
+    /// host, and only a reconnect would cure it.
     fn set_h264_config(&self, config: String) {
-        self.shared.lock().unwrap().h264 = Some(H264State::new(config));
+        let mut shared = self.shared.lock().unwrap();
+
+        if shared.h264.is_none() {
+            shared.h264 = Some(H264State::new(config));
+            return;
+        }
+
+        let h264 = shared.h264.as_mut().unwrap();
+        h264.config = config.clone();
+        h264.recent.clear();
+        h264.clients
+            .retain_mut(|client| ws::send_text(&mut client.stream, config.as_bytes()).is_ok());
     }
 
     fn h264_clients(&self) -> usize {
@@ -1221,9 +1250,20 @@ fn serve_cursor_channel(state: Arc<State>, mut socket: TcpStream, request: &str)
     let from = who.clone();
 
     ws::watch(&mut socket, move |frame| {
-        if let Some(message) = ws::text_payload(frame) {
-            channel.inject(&from, &message);
+        let Some(message) = ws::text_payload(frame) else {
+            return;
+        };
+
+        // The native client times the round trip with its own clock and only needs it echoed.
+        if let Some(clock) = message.strip_prefix("p ") {
+            if let Ok(sent) = clock.trim().parse::<u64>() {
+                channel.reply_to_cursor_client(id, &format!("{{\"pong\":{sent}}}"));
+            }
+
+            return;
         }
+
+        channel.inject(&from, &message);
     });
 
     state.release_control(&who);
@@ -1452,6 +1492,14 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
 
     state.set_frame_size(frame_width, frame_height);
 
+    // The native client channel (`/h264/ws`) is not tied to the transport: a host sharing over
+    // WebRTC so a tablet can watch can serve the desktop client at the same time, from the same
+    // encoder. So this mode publishes the decoder configuration too.
+    state.set_h264_config(format!(
+        "{{\"h264\":{{\"codec\":\"{}\",\"width\":{frame_width},\"height\":{frame_height},\"fps\":{fps}}}}}",
+        ffmpeg::codec_string(frame_width, frame_height, fps)
+    ));
+
     let encoder = ffmpeg::choose_encoder(&ffmpeg_path);
 
     let mut options = ffmpeg::Options {
@@ -1483,10 +1531,13 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
             return;
         }
 
-        while hub.viewers() == 0 {
+        // Either kind of viewer is a reason to encode: a browser over WebRTC, or the native client
+        // which takes the same access units over `/h264/ws`.
+        while hub.viewers() == 0 && state.h264_clients() == 0 {
             std::thread::sleep(Duration::from_millis(100));
         }
 
+        state.reset_h264_recent();
         state.set_capturing(Some(options.output_index));
 
         let mut encoder = match ffmpeg::Encoder::spawn(&options) {
@@ -1506,7 +1557,7 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
                 return;
             }
 
-            if hub.viewers() == 0 {
+            if hub.viewers() == 0 && state.h264_clients() == 0 {
                 break;
             }
 
@@ -1516,6 +1567,8 @@ fn encode_webrtc(state: Arc<State>, source: (usize, usize), height: usize, fps: 
                     for unit in splitter.push(&buffer[..read]) {
                         units += 1;
                         hub.broadcast(&unit.data);
+                        // The very same access units feed the native client channel.
+                        state.publish_access_unit(Arc::new(unit));
                     }
                 }
                 Err(error) => {
@@ -2123,6 +2176,19 @@ fn prime(duplicator: &mut Duplicator) -> Result<(usize, usize), CaptureError> {
 #[cfg(test)]
 mod tests {
     use super::cursor_in_frame;
+
+    /// The decoder configuration is a JSON object whose key names the mode, and the page has to
+    /// read the same key. These two sides drifted once already and the canvas just stayed black.
+    #[test]
+    fn the_decoder_configuration_uses_the_key_the_page_reads() {
+        let config = format!(
+            "{{\"h264\":{{\"codec\":\"{}\",\"width\":1920,\"height\":1200,\"fps\":60}}}}",
+            crate::ffmpeg::codec_string(1920, 1200, 60)
+        );
+
+        assert!(config.starts_with("{\"h264\":{"), "unexpected shape: {config}");
+        assert!(crate::h264_page::PAGE.contains("message.h264"));
+    }
 
     #[test]
     fn the_primary_monitor_is_the_identity_at_native_size() {

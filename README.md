@@ -111,6 +111,57 @@ m 0 0         -> (0, 0)
 快捷键都正常）；浏览器自己的快捷键抢不回来（`Ctrl+W` 还是关标签页）。控制通道**目前没有密码**，
 所以只建议在可信的局域网里开启；运行窗口里输入 `x` 回车可以立刻断开。
 
+## 原生客户端（Windows）
+
+浏览器的能力到这里就到头了：`Ctrl+W` 归浏览器、本机输入法把键吞掉、没有独占全屏。所以同一个
+exe 还有另一半——它自己就是客户端：
+
+```powershell
+.\openscreen-rs.exe view 192.168.1.23                    # 端口默认 3032
+.\openscreen-rs.exe view 192.168.1.23:3035 --fullscreen
+.\openscreen-rs.exe view 192.168.1.23 --decode-width 0   # 按原生分辨率解码
+```
+
+或者双击发行包里新加的「连接-对方电脑.bat」，按提示输入对方地址。
+
+| 浏览器做不到的 | 原生客户端 |
+|---|---|
+| 按键被浏览器拦（`Ctrl+W`、`Ctrl+T`、`F11`…） | 只有 F11（全屏）和全屏时的 Esc 留给本地，其余原样送到对端 |
+| 本机输入法吞掉按键 | 发**物理扫描码**，中文由**对端**输入法组合，候选框就在画面里 |
+| 没有独占全屏、有地址栏 | F11 无边框全屏，画面按比例贴合，本地光标隐藏、画对端的原生光标 |
+| 要开一个网页 | 一个窗口，一个进程 |
+
+实现：
+
+| 环节 | 做法 |
+|---|---|
+| 视频 | 复用 `/h264/ws`（和 WebCodecs 页面同一条通道），**不是浏览器专属**：主机开 WebRTC 时也能连，两种观看者可以同时在 |
+| 解码 | `ffmpeg.exe -f h264 -i pipe:0 -f rawvideo -pix_fmt bgra`，默认按 1920 宽解码，剩下的缩放交给 GDI |
+| 呈现 | Win32 窗口 + `StretchDIBits`，比例在 blit 时算，所以**改窗口大小不重启解码器** |
+| 输入 | 鼠标复用 `m/b/w`；键盘新增 `s <扫描码> <扩展位> <按下>`；`p`/`pong` 量回环 |
+| 光标 | 主机下发的 32×32 光标位图预乘后 `AlphaBlend`；指针在画面内时隐藏本地光标 |
+| 协议解析 | 手写的小 JSON 读取器（`src/json.rs`），因为消息格式是浏览器页面定的 |
+
+实测（本机，共享 2560x1600、解码 1920x1200、窗口 1180x740）：
+
+```
+60–61 fps · decode 5.9–9.6 ms · rtt 0–1 ms · 客户端 CPU 约 7% 单核
+```
+
+把指针放到客户端窗口正中，主机指针落在 **(1280, 771)**——桌面中心是 (1280, 800)，差值来自标题栏
+把窗口中心抬高了 29 像素。输入链路（客户端 → `/ws` → `SendInput` → 真实指针）就是这么验证的。
+
+两个只有在真机上才暴露的坑，都已修掉：
+
+- **`BeginPaint` 不能省**。用 `GetDC` 画而不校验更新区域，窗口永远是"脏"的，Windows 每秒发九百次
+  `WM_PAINT`：单核跑满、帧率数字好看，画面却几乎不动。
+- **DIB 的 `biHeight` 必须是负数**。ffmpeg 的 `rawvideo` 是自上而下的，正值会被 GDI 当成自下而上，
+  整幅画面上下颠倒（第一版截图里任务栏跑到了顶上）。
+
+限制：`Alt+Tab`、`Ctrl+Alt+Del` 被本机操作系统截获，转发不了（ToDesk 靠驱动/服务才做到）；客户端
+需要 `ffmpeg.exe`（发行包里已有）；主机必须是 **WebRTC 或 H.264** 模式——MSE 产出的是分片 MP4，
+拿不到 Annex-B 访问单元，客户端会明确说明并退出，MJPEG 同理。
+
 ## 单帧成本（MJPEG 模式，2560x1600 屏 → 1728x1080 帧，4:4:4）
 
 | 环节 | 做法 | 实测 |
@@ -363,9 +414,9 @@ MSE 天生比 WebCodecs 慢，因为它按分片播放。延迟由三部分构�
 | `/` | 当前模式的播放页（MJPEG 或 H.264） |
 | `/stream` | MJPEG 流（MJPEG 模式下任何其它路径也走这里） |
 | `/h264` | H.264 播放页 |
-| `/h264/ws` | WebSocket，二进制消息 = 一帧 H.264 访问单元（Annex-B），首条文本消息是解码器配置 |
+| `/h264/ws` | WebSocket，二进制消息 = 一帧 H.264 访问单元（Annex-B），首条文本消息是解码器配置。原生客户端用的也是它 |
 | `/webrtc/ws` | WebSocket，WebRTC 信令（offer / answer） |
-| `/ws` | WebSocket，推 `{"cursor":[x,y]}` 和 `{"control":布尔}`；开启远程控制后也接收 `m` / `b` / `w` / `k` / `r` 输入消息 |
+| `/ws` | WebSocket，推 `{"cursor":[x,y]}` 和 `{"control":布尔}`；开启远程控制后也接收 `m` / `b` / `w` / `k` / `s` / `r`，`p <时钟>` 会回 `{"pong":时钟}` |
 | `/control` | 远程控制开关：`POST on=1` / `on=0`，`GET` 查当前状态（不重启编码器） |
 
 ## 验证脚本
@@ -419,7 +470,8 @@ src/capture.rs    DXGI 桌面复制：D3D11 设备 → 主输出 → AcquireNext
 src/scaler.rs     BGRA 盒式滤波缩放 + 保持比例的目标尺寸
 src/jpeg.rs       libjpeg-turbo 运行时加载（tjInitCompress/tjCompress2）
 src/mjpeg.rs      MJPEG 分帧（CRLF、boundary、禁缓存）
-src/ws.rs         WebSocket 握手与文本/二进制帧（含手写 SHA-1 / base64，保持零依赖）
+src/ws.rs         WebSocket 握手与文本/二进制帧（含手写 SHA-1 / base64，保持零依赖）；
+                  以及客户端侧：握手、掩码帧、服务端帧切分、ping 回 pong
 src/cursor.rs     读取系统原生光标位图（GetCursorInfo/GetIconInfo/GetDIBits）
 src/input.rs      SendInput 注入：比例 → 绝对坐标、扫描码键盘、记住按下的键以便全部松开（含单元测试）
 src/player_js.rs  /player.js：光标叠加层，三个播放页共用
@@ -432,6 +484,10 @@ src/webrtc_stream.rs  WebRTC 传输：每观看端一个 peer connection，访�
 src/webrtc_page.rs    WebRTC 播放页（RTCPeerConnection + 状态栏显示 fps/rtt/jitter/丢包）
 src/ffmpeg.rs     ffmpeg 子进程：ddagrab 抓屏 + NVENC 编码，raw Annex-B 出到 stdout
 src/server.rs     单生产者 + 最新帧广播 + 自适应码率 + 光标广播 + 两种模式的路由
+src/json.rs       原生客户端用的最小 JSON 读取器（消息格式是浏览器页面定的）
+src/decode.rs     原生客户端的解码：ffmpeg 子进程 → BGRA rawvideo → 最新一帧
+src/window.rs     原生客户端的窗口：BeginPaint + StretchDIBits、光标 AlphaBlend、键鼠采集
+src/view.rs       原生客户端的应用：两条 WS、重连、状态栏、`view <host>` 子命令
 ```
 
 ## 已知取舍
@@ -464,6 +520,10 @@ src/server.rs     单生产者 + 最新帧广播 + 自适应码率 + 光标广�
 ## 还没做
 
 - 远程控制通道的**口令**（现在只靠"默认关闭 + 可信局域网"）。
+- 原生客户端的第二阶段：剪贴板双向同步、发送文本（`KEYEVENTF_UNICODE`）、在客户端里换分辨率/选屏、
+  文件拖拽传输。
+- 原生客户端的传输升级：现在走 `/h264/ws`（TCP）；要更低延迟可以接 WebRTC（RTP 解包 + ICE），
+  要更高帧率可以上 D3D11 呈现和 `-hwaccel d3d11va` 硬件解码——都等实测证明 GDI 是瓶颈再做。
 - 只抓某个窗口、系统声音。
 - 更强的自适应：现在 H.264 用固定码率，可以按实际发送延迟动态调整。
 

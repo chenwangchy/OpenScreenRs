@@ -382,9 +382,220 @@ pub fn base64(data: &[u8]) -> String {
     output
 }
 
+/// One message from a server.
+pub enum Message {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+/// A WebSocket client: the handshake out, masked frames out, server frames in.
+///
+/// It exists because the native viewer listens to the same two channels the browser pages use, and
+/// those are WebSocket. This is the other half of the functions above, not a second protocol.
+pub struct Client {
+    stream: TcpStream,
+    /// Bytes of frames that have started to arrive.
+    pending: Vec<u8>,
+    /// Masking keys. Masking is not security, it only stops a cache from mistaking a frame for an
+    /// HTTP request, so a shifting value is enough.
+    noise: u32,
+}
+
+impl Client {
+    /// Connects and upgrades. `address` is `host:port`, `path` includes the leading slash.
+    pub fn connect(address: &str, path: &str) -> std::io::Result<Self> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_nodelay(true)?;
+
+        let key = base64(&nonce());
+        let request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: {address}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        stream.write_all(request.as_bytes())?;
+        stream.flush()?;
+
+        let response = read_request(&mut stream)?;
+
+        if !response.starts_with("HTTP/1.1 101") {
+            return Err(std::io::Error::other(format!(
+                "not a WebSocket: {}",
+                response.lines().next().unwrap_or("no answer")
+            )));
+        }
+
+        match header(&response, "sec-websocket-accept") {
+            Some(answer) if answer == accept_key(&key) => {}
+            _ => return Err(std::io::Error::other("the server answered the wrong accept key")),
+        }
+
+        Ok(Self {
+            stream,
+            pending: Vec::new(),
+            noise: seed(),
+        })
+    }
+
+    /// Bounds a blocking read, which is what lets one thread also drain a queue of input.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(timeout)
+    }
+
+    pub fn send_text(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        self.send(0x1, payload)
+    }
+
+    fn send(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
+        self.noise ^= self.noise << 13;
+        self.noise ^= self.noise >> 17;
+        self.noise ^= self.noise << 5;
+
+        self.stream
+            .write_all(&masked_frame(opcode, payload, self.noise.to_le_bytes()))?;
+        self.stream.flush()
+    }
+
+    /// The next message, answering pings on the way.
+    pub fn read(&mut self) -> std::io::Result<Message> {
+        loop {
+            if let Some(message) = self.take_message()? {
+                return Ok(message);
+            }
+
+            let mut scratch = [0u8; 64 * 1024];
+            let read = std::io::Read::read(&mut self.stream, &mut scratch)?;
+
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+
+            self.pending.extend_from_slice(&scratch[..read]);
+        }
+    }
+
+    fn take_message(&mut self) -> std::io::Result<Option<Message>> {
+        loop {
+            let Some((opcode, payload)) = take_frame(&mut self.pending) else {
+                return Ok(None);
+            };
+
+            match opcode {
+                0x1 => {
+                    return Ok(Some(Message::Text(
+                        String::from_utf8_lossy(&payload).into_owned(),
+                    )))
+                }
+                0x2 => return Ok(Some(Message::Binary(payload))),
+                0x8 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                // A ping must be answered: the host drops a viewer after three unanswered ones,
+                // and it counts ten seconds of silence each.
+                0x9 => self.send(0xA, &payload)?,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One masked frame, the only shape a client is allowed to send.
+fn masked_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 14);
+    frame.push(0x80 | opcode);
+
+    if payload.len() < 126 {
+        frame.push(0x80 | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(0x80 | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(0x80 | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % 4]),
+    );
+
+    frame
+}
+
+/// Splits the first whole frame off a buffer of bytes from a server, which are never masked.
+fn take_frame(buffer: &mut Vec<u8>) -> Option<(u8, Vec<u8>)> {
+    if buffer.len() < 2 {
+        return None;
+    }
+
+    let opcode = buffer[0] & 0x0f;
+
+    let (length, header) = match buffer[1] & 0x7f {
+        126 => {
+            if buffer.len() < 4 {
+                return None;
+            }
+
+            (u16::from_be_bytes([buffer[2], buffer[3]]) as usize, 4)
+        }
+        127 => {
+            if buffer.len() < 10 {
+                return None;
+            }
+
+            let mut size = [0u8; 8];
+            size.copy_from_slice(&buffer[2..10]);
+
+            (usize::try_from(u64::from_be_bytes(size)).ok()?, 10)
+        }
+        short => (short as usize, 2),
+    };
+
+    if buffer.len() < header + length {
+        return None;
+    }
+
+    let payload = buffer[header..header + length].to_vec();
+    buffer.drain(..header + length);
+
+    Some((opcode, payload))
+}
+
+/// Sixteen bytes for `Sec-WebSocket-Key`: it only has to be unpredictable enough that two clients
+/// do not pick the same key.
+fn nonce() -> [u8; 16] {
+    let mut state = seed();
+    let mut bytes = [0u8; 16];
+
+    for chunk in bytes.chunks_mut(4) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+
+    bytes
+}
+
+/// A starting value that differs between runs, for the mask and the handshake key.
+fn seed() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() ^ elapsed.as_secs() as u32)
+        .unwrap_or(0x811C_9DC5);
+
+    // xorshift32 never leaves zero, so the seed must not be it either.
+    (nanos ^ std::process::id()).max(1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::frame_length;
+    use super::{frame_length, masked_frame, take_frame, text_payload};
 
     /// A masked text frame of `payload` bytes, the shape a browser sends an answer in.
     fn masked_text(payload: usize) -> Vec<u8> {
@@ -393,6 +604,45 @@ mod tests {
         frame.extend_from_slice(&[1, 2, 3, 4]);
         frame.extend(std::iter::repeat(0u8).take(payload));
         frame
+    }
+
+    #[test]
+    fn a_client_frame_is_masked_and_reads_back() {
+        // The browser path and the native client path share one parser: a frame built by the
+        // client must come out of `text_payload` unchanged.
+        let frame = masked_frame(0x1, b"m 5000 5000", [0x11, 0x22, 0x33, 0x44]);
+
+        assert_eq!(frame[1] & 0x80, 0x80, "a client frame must be masked");
+        assert_eq!(text_payload(&frame).as_deref(), Some("m 5000 5000"));
+        assert_eq!(frame_length(&frame), Some(frame.len()));
+    }
+
+    #[test]
+    fn a_server_frame_is_split_off_whole() {
+        let mut buffer = vec![0x82, 3, 1, 2, 3];
+
+        // A 600 byte binary frame: long enough to use the 16 bit length, still unmasked.
+        let mut long = vec![0x82, 0x80 | 126];
+        long.extend_from_slice(&600u16.to_be_bytes());
+        long.extend(std::iter::repeat(7u8).take(600));
+        buffer.extend_from_slice(&long);
+
+        assert_eq!(take_frame(&mut buffer), Some((0x2, vec![1, 2, 3])));
+        assert_eq!(
+            take_frame(&mut buffer).map(|(opcode, payload)| (opcode, payload.len())),
+            Some((0x2, 600))
+        );
+
+        assert_eq!(take_frame(&mut buffer), None);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_control_frame_is_surfaced_for_the_ping_answer() {
+        let mut buffer = vec![0x89, 0x00];
+
+        assert_eq!(take_frame(&mut buffer), Some((0x9, Vec::new())));
+        assert_eq!(take_frame(&mut buffer), None);
     }
 
     #[test]
